@@ -317,6 +317,73 @@ def parse_cards_batched(image: np.ndarray, cards: list[Card], layout: str) -> li
     ]
 
 
+def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> list[dict]:
+    """Read fixed title/score bands directly; avoids costly text detection."""
+    crops: list[np.ndarray] = []
+    title_images: list[np.ndarray] = []
+    score_images: list[np.ndarray] = []
+    if layout == "mate":
+        title_box = (0.275, 0.045, 0.995, 0.34)
+        score_box = (0.28, 0.40, 0.75, 0.70)
+    else:
+        title_box = (0.34, 0.10, 0.995, 0.34)
+        score_box = (0.34, 0.29, 0.82, 0.66)
+
+    def band(crop: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray:
+        h, w = crop.shape[:2]
+        x1, y1, x2, y2 = box
+        roi = crop[int(h * y1):max(int(h * y2), int(h * y1) + 1),
+                   int(w * x1):max(int(w * x2), int(w * x1) + 1)]
+        return cv2.resize(roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+
+    for card in cards:
+        crop = image[
+            card.y:min(card.y + card.h, image.shape[0]),
+            card.x:min(card.x + card.w, image.shape[1]),
+        ]
+        if not crop.size:
+            continue
+        crops.append(crop)
+        title_images.append(band(crop, title_box))
+        score_image = band(crop, score_box)
+        score_images.append(cv2.copyMakeBorder(
+            score_image, 12, 12, 20, 20, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+        ))
+
+    title_output = ocr.recognize_txt(title_images)
+    score_output = ocr.recognize_txt(score_images)
+    results: list[dict] = []
+    for index, (crop, raw_name, raw_score) in enumerate(
+        zip(crops, title_output.txts, score_output.txts), 1
+    ):
+        name = re.sub(r"\s+(MASTER|ULTIMA|EXPERT|ADVANCED|BASIC).*$", "", str(raw_name), flags=re.I)
+        name = re.sub(r"\s+", " ", name).strip(" .|_-\u3000")
+        name = re.sub(r"ー{2,}$", "ー", name)
+        digits = re.sub(r"\D", "", str(raw_score))
+        score = ""
+        if len(digits) in (6, 7):
+            score = digits
+        elif len(digits) == 8 and digits.startswith("100"):
+            score = digits[:3] + digits[4:]
+        elif len(digits) > 7:
+            candidates = re.findall(r"\d{7,8}", digits)
+            if candidates:
+                value = candidates[0]
+                score = value if len(value) == 7 else value[:3] + value[4:]
+
+        ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 82])
+        preview = "data:image/jpeg;base64," + base64.b64encode(encoded).decode() if ok else ""
+        results.append({
+            "index": index,
+            "score": score,
+            "name": name,
+            "difficulty": classify_difficulty(crop),
+            "preview": preview,
+            "raw": [str(raw_name), str(raw_score)],
+        })
+    return results
+
+
 @app.get("/")
 def home():
     return render_template("index.html")
@@ -333,7 +400,7 @@ def recognize():
         cards = reading_order(detect_cards(image))
         if expected in (45, 50):
             cards = cards[:expected]
-        results = parse_cards_batched(image, cards, layout_name(image))
+        results = parse_cards_direct(image, cards, layout_name(image))
         return jsonify({"count": len(results), "layout": layout_name(image), "items": results})
     except Exception as exc:
         return jsonify({"error": f"识别失败：{exc}"}), 500
