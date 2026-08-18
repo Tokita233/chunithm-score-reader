@@ -3,6 +3,7 @@ services:
     name: chunithm-score-reader
     runtime: python
     plan: free
+    autoDeployTrigger: commit
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 app:app
     healthCheckPath: /
