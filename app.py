@@ -107,10 +107,11 @@ def layout_name(image: np.ndarray) -> str:
     return "mate" if w / h >= 0.82 else "tippy"
 
 
-def template_cards(image: np.ndarray) -> list[Card]:
+def template_cards(image: np.ndarray, layout: str | None = None) -> list[Card]:
     """Normalized coordinates for both supported five-column report UIs."""
     h, w = image.shape[:2]
-    if layout_name(image) == "mate":
+    layout = layout or layout_name(image)
+    if layout == "mate":
         # CHUNITHM MATE Best 50 Information: 30 cards above, 20 below.
         xs = [0.0167, 0.2111, 0.4056, 0.6000, 0.7944]
         top_ys = [0.16625, 0.24125, 0.31625, 0.39125, 0.46625, 0.54125]
@@ -133,20 +134,21 @@ def template_cards(image: np.ndarray) -> list[Card]:
     ]
 
 
-def detect_cards(image: np.ndarray) -> list[Card]:
+def detect_cards(image: np.ndarray, layout: str | None = None) -> list[Card]:
     """Detect the 5-column layout; fall back to normalized template coordinates."""
     h, w = image.shape[:2]
+    layout = layout or layout_name(image)
     # The MATE layout is highly regular and has colored cards on a pale
     # background, where dark-pixel contour detection is less reliable.
-    if layout_name(image) == "mate":
-        return template_cards(image)
+    if layout == "mate":
+        return template_cards(image, layout)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     # Ignore header/banner regions when finding the five repeated columns.
     body = gray[int(h * 0.22):, :]
     x_centers = projection_centers(body, axis=0, expected=5)
     if len(x_centers) != 5:
-        return template_cards(image)
+        return template_cards(image, layout)
 
     # Card rows are short, dark horizontal bands. Locate connected components
     # after a wide horizontal close, then merge nearly identical y positions.
@@ -161,7 +163,7 @@ def detect_cards(image: np.ndarray) -> list[Card]:
             ys.append(y)
     row_ys = merge_intervals(ys, max(8, int(h * 0.012)))
     if len(row_ys) < 7:
-        return template_cards(image)
+        return template_cards(image, layout)
 
     cw, ch = round(w * 0.184), round(h * 0.054)
     lefts = [max(0, round(c - cw / 2)) for c in x_centers]
@@ -414,12 +416,14 @@ def recognize():
         return jsonify({"error": "请选择图片"}), 400
     try:
         image = decode_image(upload.read())
+        requested_layout = request.form.get("layout", "auto")
+        layout = requested_layout if requested_layout in ("tippy", "mate") else layout_name(image)
         expected = int(request.form.get("expected", "45"))
-        cards = reading_order(detect_cards(image))
+        cards = reading_order(detect_cards(image, layout))
         if expected in (45, 50):
             cards = cards[:expected]
-        results = parse_cards_direct(image, cards, layout_name(image))
-        return jsonify({"count": len(results), "layout": layout_name(image), "items": results})
+        results = parse_cards_direct(image, cards, layout)
+        return jsonify({"count": len(results), "layout": layout, "items": results})
     except Exception as exc:
         return jsonify({"error": f"识别失败：{exc}"}), 500
 

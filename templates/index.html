@@ -34,9 +34,16 @@
   <p class="sub">按从左到右、从上到下的顺序识别；结果可直接修正，命令和复制内容会同步更新。</p>
   <form class="toolbar" id="form">
     <input id="image" name="image" type="file" accept="image/*" required>
+    <label>版式
+      <select id="layout" name="layout">
+        <option value="auto" selected>自动检测</option>
+        <option value="tippy">旧版 Tippy Bot</option>
+        <option value="mate">新版 CHUNITHM MATE</option>
+      </select>
+    </label>
     <label>读取
       <select id="expected" name="expected">
-        <option value="0" selected>自动检测</option>
+        <option value="0" selected>全部</option>
         <option value="45">45 首</option>
         <option value="50">50 首</option>
       </select>
