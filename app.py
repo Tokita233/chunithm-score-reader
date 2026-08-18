@@ -326,8 +326,11 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
         title_box = (0.275, 0.045, 0.995, 0.34)
         score_box = (0.28, 0.40, 0.75, 0.70)
     else:
-        title_box = (0.34, 0.10, 0.995, 0.34)
-        score_box = (0.34, 0.29, 0.82, 0.66)
+        # The old Tippy Bot card has a separate rank header above the title.
+        # Keep below that header, and include the full score width so its last
+        # digit is not clipped off.
+        title_box = (0.355, 0.18, 0.995, 0.39)
+        score_box = (0.35, 0.35, 0.995, 0.71)
 
     def band(crop: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray:
         h, w = crop.shape[:2]
@@ -370,6 +373,21 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             if candidates:
                 value = candidates[0]
                 score = value if len(value) == 7 else value[:3] + value[4:]
+
+        score_is_valid = score.isdigit() and 900000 <= int(score) <= 1010000
+        name_letters = re.sub(r"[^A-Za-z\u3040-\u30ff\u3400-\u9fff]", "", name)
+        if not score_is_valid or len(name_letters) < 2:
+            # A few old cards use artwork/contrast that confuses direct line
+            # recognition. Run the slower detector only for those cards.
+            fallback = parse_card(crop, index, layout)
+            fallback_score = fallback["score"]
+            if (
+                fallback_score.isdigit()
+                and 900000 <= int(fallback_score) <= 1010000
+            ):
+                score = fallback_score
+            if fallback["name"]:
+                name = fallback["name"]
 
         ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 82])
         preview = "data:image/jpeg;base64," + base64.b64encode(encoded).decode() if ok else ""
