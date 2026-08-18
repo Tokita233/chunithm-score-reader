@@ -203,13 +203,12 @@ def classify_difficulty(crop: np.ndarray) -> str:
     return "Master"
 
 
-def parse_card(crop: np.ndarray, index: int, layout: str = "tippy") -> dict:
-    h, w = crop.shape[:2]
-    # OCR only the information panel; the jacket often contains distracting text.
-    panel_start = 0.275 if layout == "mate" else 0.34
-    panel = crop[:, int(w * panel_start):]
-    panel = cv2.resize(panel, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC)
-    lines = text_lines(panel)
+def build_card_result(
+    crop: np.ndarray,
+    index: int,
+    lines: list[tuple[str, float, float]],
+    panel_height: int,
+) -> dict:
     raw_text = [text for text, confidence, _ in lines if confidence >= 0.35]
 
     score = ""
@@ -238,7 +237,7 @@ def parse_card(crop: np.ndarray, index: int, layout: str = "tippy") -> dict:
             continue
         if len(re.sub(r"[^A-Za-z\u3040-\u30ff\u3400-\u9fff]", "", cleaned)) < 2:
             continue
-        if y < panel.shape[0] * 0.12 or y > panel.shape[0] * 0.52:
+        if y < panel_height * 0.12 or y > panel_height * 0.52:
             continue
         names.append(cleaned)
     name = max(names, key=len) if names else ""
@@ -253,6 +252,69 @@ def parse_card(crop: np.ndarray, index: int, layout: str = "tippy") -> dict:
         "preview": preview,
         "raw": raw_text,
     }
+
+
+def parse_card(crop: np.ndarray, index: int, layout: str = "tippy") -> dict:
+    h, w = crop.shape[:2]
+    panel_start = 0.275 if layout == "mate" else 0.34
+    panel = crop[:, int(w * panel_start):]
+    panel = cv2.resize(panel, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC)
+    return build_card_result(crop, index, text_lines(panel), panel.shape[0])
+
+
+def parse_cards_batched(image: np.ndarray, cards: list[Card], layout: str) -> list[dict]:
+    """OCR five cards together so cloud CPUs finish well inside proxy limits."""
+    crops: list[np.ndarray] = []
+    panels: list[np.ndarray] = []
+    panel_start = 0.275 if layout == "mate" else 0.34
+    for card in cards:
+        crop = image[
+            card.y:min(card.y + card.h, image.shape[0]),
+            card.x:min(card.x + card.w, image.shape[1]),
+        ]
+        if not crop.size:
+            continue
+        crops.append(crop)
+        panel = crop[:, int(crop.shape[1] * panel_start):]
+        panels.append(cv2.resize(panel, None, fx=2.4, fy=2.4, interpolation=cv2.INTER_CUBIC))
+
+    all_lines: list[list[tuple[str, float, float]]] = [[] for _ in panels]
+    batch_size, cols, gap = 5, 2, 16
+    for start in range(0, len(panels), batch_size):
+        batch = panels[start:start + batch_size]
+        tile_w = max(panel.shape[1] for panel in batch)
+        tile_h = max(panel.shape[0] for panel in batch)
+        rows = (len(batch) + cols - 1) // cols
+        canvas = np.full(
+            (rows * tile_h + (rows + 1) * gap, cols * tile_w + (cols + 1) * gap, 3),
+            255,
+            dtype=np.uint8,
+        )
+        placements: list[tuple[int, int, int, int]] = []
+        for local_index, panel in enumerate(batch):
+            row, col = divmod(local_index, cols)
+            x0 = gap + col * (tile_w + gap)
+            y0 = gap + row * (tile_h + gap)
+            canvas[y0:y0 + panel.shape[0], x0:x0 + panel.shape[1]] = panel
+            placements.append((x0, y0, panel.shape[1], panel.shape[0]))
+
+        output = ocr(canvas)
+        if output.boxes is None:
+            continue
+        for box, text, confidence in zip(output.boxes, output.txts, output.scores):
+            cx = float(np.mean([point[0] for point in box]))
+            cy = float(np.mean([point[1] for point in box]))
+            for local_index, (x0, y0, pw, ph) in enumerate(placements):
+                if x0 <= cx <= x0 + pw and y0 <= cy <= y0 + ph:
+                    all_lines[start + local_index].append(
+                        (str(text).strip(), float(confidence), cy - y0)
+                    )
+                    break
+
+    return [
+        build_card_result(crop, index, sorted(lines, key=lambda row: row[2]), panel.shape[0])
+        for index, (crop, panel, lines) in enumerate(zip(crops, panels, all_lines), 1)
+    ]
 
 
 @app.get("/")
@@ -271,12 +333,7 @@ def recognize():
         cards = reading_order(detect_cards(image))
         if expected in (45, 50):
             cards = cards[:expected]
-        results = []
-        for i, card in enumerate(cards, 1):
-            crop = image[card.y:min(card.y + card.h, image.shape[0]),
-                         card.x:min(card.x + card.w, image.shape[1])]
-            if crop.size:
-                results.append(parse_card(crop, i, layout_name(image)))
+        results = parse_cards_batched(image, cards, layout_name(image))
         return jsonify({"count": len(results), "layout": layout_name(image), "items": results})
     except Exception as exc:
         return jsonify({"error": f"识别失败：{exc}"}), 500
