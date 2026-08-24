@@ -12,6 +12,7 @@ import numpy as np
 from flask import Flask, jsonify, render_template, request
 from PIL import Image
 from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+from rapidocr.ch_ppocr_rec import TextRecInput, TextRecognizer
 
 
 app = Flask(__name__)
@@ -19,18 +20,46 @@ app.config["MAX_CONTENT_LENGTH"] = 20 * 1024 * 1024
 # Use the dedicated Japanese recognizer rather than a generic CJK model.  Its
 # dictionary includes kana, kanji, Latin letters and digits, which matches
 # CHUNITHM titles better (especially tiny hiragana/katakana in report cards).
-ocr = RapidOCR(
-    params={
-        "Det.engine_type": EngineType.ONNXRUNTIME,
-        "Det.lang_type": LangDet.CH,
-        "Det.model_type": ModelType.MOBILE,
-        "Det.ocr_version": OCRVersion.PPOCRV4,
-        "Rec.engine_type": EngineType.ONNXRUNTIME,
-        "Rec.lang_type": LangRec.JAPAN,
-        "Rec.model_type": ModelType.MOBILE,
-        "Rec.ocr_version": OCRVersion.PPOCRV4,
-    }
-)
+OCR_PARAMS = {
+    "Global.log_level": "warning",
+    "EngineConfig.onnxruntime.intra_op_num_threads": 1,
+    "EngineConfig.onnxruntime.inter_op_num_threads": 1,
+    "Det.engine_type": EngineType.ONNXRUNTIME,
+    "Det.lang_type": LangDet.CH,
+    "Det.model_type": ModelType.MOBILE,
+    "Det.ocr_version": OCRVersion.PPOCRV4,
+    "Rec.engine_type": EngineType.ONNXRUNTIME,
+    "Rec.lang_type": LangRec.JAPAN,
+    "Rec.model_type": ModelType.MOBILE,
+    "Rec.ocr_version": OCRVersion.PPOCRV4,
+}
+
+
+class RecognitionOnlyOCR:
+    """Load only the Japanese recognizer, not two unused OCR models."""
+
+    def __init__(self) -> None:
+        loader = RapidOCR.__new__(RapidOCR)
+        cfg = loader._load_config(None, OCR_PARAMS)
+        cfg.Rec.engine_cfg = cfg.EngineConfig[cfg.Rec.engine_type.value]
+        cfg.Rec.font_path = cfg.Global.font_path
+        cfg.Rec.model_root_dir = cfg.Global.model_root_dir
+        self.recognizer = TextRecognizer(cfg.Rec)
+
+    def recognize_txt(self, images: list[np.ndarray]):
+        return self.recognizer(TextRecInput(img=images))
+
+
+ocr = RecognitionOnlyOCR()
+_full_ocr: RapidOCR | None = None
+
+
+def full_ocr() -> RapidOCR:
+    """Legacy detector for diagnostic helpers; never loaded by the web path."""
+    global _full_ocr
+    if _full_ocr is None:
+        _full_ocr = RapidOCR(params=OCR_PARAMS)
+    return _full_ocr
 
 
 @dataclass
@@ -173,7 +202,7 @@ def detect_cards(image: np.ndarray, layout: str | None = None) -> list[Card]:
 
 
 def text_lines(crop: np.ndarray) -> list[tuple[str, float, float]]:
-    result = ocr(crop)
+    result = full_ocr()(crop)
     lines: list[tuple[str, float, float]] = []
     if result.boxes is None:
         return lines
@@ -332,7 +361,7 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
         # Keep below that header, and include the full score width so its last
         # digit is not clipped off.
         title_box = (0.355, 0.18, 0.995, 0.39)
-        score_box = (0.35, 0.35, 0.995, 0.71)
+        score_box = (0.35, 0.40, 0.995, 0.76)
 
     def band(crop: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray:
         h, w = crop.shape[:2]
@@ -375,21 +404,6 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             if candidates:
                 value = candidates[0]
                 score = value if len(value) == 7 else value[:3] + value[4:]
-
-        score_is_valid = score.isdigit() and 900000 <= int(score) <= 1010000
-        name_letters = re.sub(r"[^A-Za-z\u3040-\u30ff\u3400-\u9fff]", "", name)
-        if not score_is_valid or len(name_letters) < 2:
-            # A few old cards use artwork/contrast that confuses direct line
-            # recognition. Run the slower detector only for those cards.
-            fallback = parse_card(crop, index, layout)
-            fallback_score = fallback["score"]
-            if (
-                fallback_score.isdigit()
-                and 900000 <= int(fallback_score) <= 1010000
-            ):
-                score = fallback_score
-            if fallback["name"]:
-                name = fallback["name"]
 
         ok, encoded = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 82])
         preview = "data:image/jpeg;base64," + base64.b64encode(encoded).decode() if ok else ""

@@ -5,8 +5,12 @@ services:
     plan: free
     autoDeployTrigger: commit
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 180 app:app
+    startCommand: gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 1 --timeout 180 app:app
     healthCheckPath: /
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      - key: OMP_NUM_THREADS
+        value: 1
+      - key: OPENBLAS_NUM_THREADS
+        value: 1
