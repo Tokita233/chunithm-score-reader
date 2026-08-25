@@ -430,8 +430,8 @@ def recognize():
         return jsonify({"error": "请选择图片"}), 400
     try:
         image = decode_image(upload.read())
-        requested_layout = request.form.get("layout", "auto")
-        layout = requested_layout if requested_layout in ("tippy", "mate") else layout_name(image)
+        requested_layout = request.form.get("layout", "tippy")
+        layout = requested_layout if requested_layout in ("tippy", "mate") else "tippy"
         expected = int(request.form.get("expected", "45"))
         cards = reading_order(detect_cards(image, layout))
         if expected in (45, 50):
