@@ -277,13 +277,18 @@ def build_card_result(
     score = ""
     score_candidates: list[str] = []
     for text in raw_text:
-        digits = re.sub(r"\D", "", text)
+        # Small white score glyphs are the hardest part of low-resolution
+        # Tippy reports.  OCR commonly reads 8 as B and a final 9 as 日.
+        numeric_text = text.upper().translate(str.maketrans({"B": "8", "日": "9"}))
+        digits = re.sub(r"\D", "", numeric_text)
         if 6 <= len(digits) <= 8:
             score_candidates.append(digits)
     if score_candidates:
         candidate = max(score_candidates, key=lambda value: (len(value), value))
         # Reports display e.g. 100,7649, meaning score 1,007,649.
         if len(candidate) == 7:
+            score = candidate
+        elif len(candidate) == 6:
             score = candidate
         elif len(candidate) == 8 and candidate.startswith("100"):
             score = candidate[:3] + candidate[4:]
@@ -361,7 +366,7 @@ def parse_cards_batched(image: np.ndarray, cards: list[Card], layout: str) -> li
             canvas[y0:y0 + panel.shape[0], x0:x0 + panel.shape[1]] = panel
             placements.append((x0, y0, panel.shape[1], panel.shape[0]))
 
-        output = ocr(canvas)
+        output = full_ocr()(canvas)
         if output.boxes is None:
             continue
         for box, text, confidence in zip(output.boxes, output.txts, output.scores):
@@ -393,9 +398,9 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
         score_box = (0.28, 0.40, 0.75, 0.70)
     else:
         # The old Tippy Bot card has a separate rank header above the title.
-        # Keep below that header, and include the full score width so its last
-        # digit is not clipped off.
-        title_box = (0.355, 0.18, 0.995, 0.39)
+        # Start at 22%: at 18% the rank/constant badges bleed into short titles,
+        # especially in the last BEST row of 1295px-wide reports.
+        title_box = (0.350, 0.22, 0.995, 0.43)
         score_box = (0.35, 0.40, 0.995, 0.76)
 
     def band(crop: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray:
@@ -477,6 +482,87 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
     return results
 
 
+def plausible_report_score(score: str) -> bool:
+    """Reject OCR shapes that cannot be a CHUNITHM report score."""
+    if not re.fullmatch(r"\d{6,7}", score):
+        return False
+    value = int(score)
+    return 100_000 <= value <= 1_010_000
+
+
+def prefer_direct_title(detected: str, direct: str) -> bool:
+    """Use the direct pass when detection clearly lost a title prefix."""
+    if not direct:
+        return False
+    if not detected:
+        return True
+    def normalize(value: str) -> str:
+        return re.sub(
+            r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]", "", value
+        ).lower()
+    detected_key = normalize(detected)
+    direct_key = normalize(direct)
+    if len(direct_key) < len(detected_key) + 2:
+        return False
+    if not detected[0].isalnum():
+        return True
+    position = direct_key.find(detected_key)
+    return position > 0 and bool(
+        re.search(r"[\u3040-\u30ff\u3400-\u9fff]", direct_key[:position])
+    )
+
+
+def merge_tippy_results(
+    image: np.ndarray,
+    cards: list[Card],
+    detected: list[dict],
+    direct: list[dict],
+) -> list[dict]:
+    """Combine accurate text boxes with the fast fixed-band recognizer.
+
+    Detection gives much cleaner titles, while direct recognition is usually
+    stronger on the large score digits.  Only cards for which both score
+    readings fail are sent through the slower single-card fallback.
+    """
+    results: list[dict] = []
+    for card, detected_item, direct_item in zip(cards, detected, direct):
+        detected_score = detected_item["score"]
+        direct_score = direct_item["score"]
+
+        # Six digits beginning with 100 are normally a clipped seven-digit
+        # 1,00x,xxx score in a B30/N20 report (seen in both supplied samples).
+        direct_is_clipped = len(direct_score) == 6 and direct_score.startswith("100")
+        if plausible_report_score(direct_score) and not direct_is_clipped:
+            score = direct_score
+        elif plausible_report_score(detected_score):
+            score = detected_score
+        else:
+            crop = image[
+                card.y:min(card.y + card.h, image.shape[0]),
+                card.x:min(card.x + card.w, image.shape[1]),
+            ]
+            fallback = parse_card(crop, detected_item["index"], "tippy")
+            fallback_score = fallback["score"]
+            score = fallback_score if plausible_report_score(fallback_score) else ""
+
+        detected_item["score"] = score
+        if prefer_direct_title(detected_item["name"], direct_item["name"]):
+            detected_item["name"] = direct_item["name"]
+        detected_item["raw"] = {
+            "detected": detected_item["raw"],
+            "direct": direct_item["raw"],
+        }
+        results.append(detected_item)
+    return results
+
+
+def parse_tippy_report(image: np.ndarray, cards: list[Card]) -> list[dict]:
+    """Recognize a Tippy report with field detection and score fusion."""
+    detected = parse_cards_batched(image, cards, "tippy")
+    direct = parse_cards_direct(image, cards, "tippy")
+    return merge_tippy_results(image, cards, detected, direct)
+
+
 @app.get("/")
 def home():
     return render_template("index.html")
@@ -493,7 +579,10 @@ def recognize():
         layout = requested_layout if requested_layout in ("tippy", "mate", "lx") else "tippy"
         cards = reading_order(detect_cards(image, layout))
         cards = cards[:50]
-        results = parse_cards_direct(image, cards, layout)
+        if layout == "tippy":
+            results = parse_tippy_report(image, cards)
+        else:
+            results = parse_cards_direct(image, cards, layout)
         return jsonify({"count": len(results), "layout": layout, "items": results})
     except Exception as exc:
         return jsonify({"error": f"识别失败：{exc}"}), 500
