@@ -491,10 +491,8 @@ def recognize():
         image = decode_image(upload.read())
         requested_layout = request.form.get("layout", "tippy")
         layout = requested_layout if requested_layout in ("tippy", "mate", "lx") else "tippy"
-        expected = int(request.form.get("expected", "45"))
         cards = reading_order(detect_cards(image, layout))
-        if expected in (45, 50):
-            cards = cards[:expected]
+        cards = cards[:50]
         results = parse_cards_direct(image, cards, layout)
         return jsonify({"count": len(results), "layout": layout, "items": results})
     except Exception as exc:
