@@ -137,9 +137,21 @@ def layout_name(image: np.ndarray) -> str:
 
 
 def template_cards(image: np.ndarray, layout: str | None = None) -> list[Card]:
-    """Normalized coordinates for both supported five-column report UIs."""
+    """Normalized coordinates for the supported five-column report UIs."""
     h, w = image.shape[:2]
     layout = layout or layout_name(image)
+    if layout == "lx":
+        # LxBot: BEST 30 above and NEW 20 below.  The ten cards between them
+        # belong to SELECTION 10 and are deliberately omitted.
+        xs = [0.0190, 0.2147, 0.4104, 0.6048, 0.8004]
+        best_ys = [0.1575, 0.2196, 0.2818, 0.3440, 0.4062, 0.4684]
+        new_ys = [0.7169, 0.7790, 0.8411, 0.9032]
+        cw, ch = round(w * 0.1815), round(h * 0.0548)
+        return [
+            Card(round(w * x), round(h * y), cw, ch)
+            for y in best_ys + new_ys
+            for x in xs
+        ]
     if layout == "mate":
         # CHUNITHM MATE Best 50 Information: 30 cards above, 20 below.
         xs = [0.0167, 0.2111, 0.4056, 0.6000, 0.7944]
@@ -169,7 +181,7 @@ def detect_cards(image: np.ndarray, layout: str | None = None) -> list[Card]:
     layout = layout or layout_name(image)
     # The MATE layout is highly regular and has colored cards on a pale
     # background, where dark-pixel contour detection is less reliable.
-    if layout == "mate":
+    if layout in ("mate", "lx"):
         return template_cards(image, layout)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -212,8 +224,28 @@ def text_lines(crop: np.ndarray) -> list[tuple[str, float, float]]:
     return sorted(lines, key=lambda row: row[2])
 
 
-def classify_difficulty(crop: np.ndarray) -> str:
+def classify_difficulty(crop: np.ndarray, layout: str = "tippy") -> str:
     h, w = crop.shape[:2]
+    if layout == "lx":
+        # LxBot uses the entire information panel as the difficulty color:
+        # purple=MASTER, black with a red slash=ULTIMA, red=EXPERT.
+        panel = crop[int(h * 0.08):int(h * 0.88), int(w * 0.33):]
+        hsv = cv2.cvtColor(panel, cv2.COLOR_BGR2HSV)
+        hue, sat, val = cv2.split(hsv)
+        vivid = (sat > 80) & (val > 65)
+        purple = vivid & (hue >= 125) & (hue <= 170)
+        red = vivid & ((hue <= 12) | (hue >= 172))
+        dark = val < 72
+        if red.mean() > 0.045 and dark.mean() > 0.24:
+            return "Ultima"
+        if red.mean() > 0.16:
+            return "Expert"
+        if purple.mean() > 0.12:
+            return "Master"
+        green = vivid & (hue >= 35) & (hue <= 90)
+        if green.mean() > 0.10:
+            return "Advanced"
+        return "Master"
     # Difficulty/constant pill sits on the top band, right of the #rank badge.
     pill = crop[0:max(8, int(h * 0.22)), int(w * 0.47):int(w * 0.79)]
     hsv = cv2.cvtColor(pill, cv2.COLOR_BGR2HSV)
@@ -353,7 +385,10 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
     crops: list[np.ndarray] = []
     title_images: list[np.ndarray] = []
     score_images: list[np.ndarray] = []
-    if layout == "mate":
+    if layout == "lx":
+        title_box = (0.335, 0.13, 0.990, 0.34)
+        score_box = (0.335, 0.34, 0.825, 0.57)
+    elif layout == "mate":
         title_box = (0.275, 0.045, 0.995, 0.34)
         score_box = (0.28, 0.40, 0.75, 0.70)
     else:
@@ -378,7 +413,15 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
         if not crop.size:
             continue
         crops.append(crop)
-        title_images.append(band(crop, title_box))
+        title_image = band(crop, title_box)
+        if layout == "lx":
+            # LxBot titles are white on a textured purple/black background.
+            # Keeping only bright glyphs prevents that texture being decoded
+            # as random trailing Latin characters.
+            gray_title = cv2.cvtColor(title_image, cv2.COLOR_BGR2GRAY)
+            _, bright_title = cv2.threshold(gray_title, 175, 255, cv2.THRESH_BINARY)
+            title_image = cv2.cvtColor(cv2.bitwise_not(bright_title), cv2.COLOR_GRAY2BGR)
+        title_images.append(title_image)
         score_image = band(crop, score_box)
         score_images.append(cv2.copyMakeBorder(
             score_image, 12, 12, 20, 20, cv2.BORDER_CONSTANT, value=(255, 255, 255)
@@ -392,10 +435,26 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
     ):
         name = re.sub(r"\s+(MASTER|ULTIMA|EXPERT|ADVANCED|BASIC).*$", "", str(raw_name), flags=re.I)
         name = re.sub(r"\s+", " ", name).strip(" .|_-\u3000")
+        if layout == "lx":
+            name = name.strip(" .'\"?|-\u3000")
+            name = re.sub(r"\s+[-'\".?]*(?:e|w|we|wt|rm|me)[.'\"?]*$", "", name, flags=re.I).strip()
         name = re.sub(r"ー{2,}$", "ー", name)
-        digits = re.sub(r"\D", "", str(raw_score))
+        raw_score_text = str(raw_score)
+        digits = re.sub(r"\D", "", raw_score_text)
         score = ""
-        if len(digits) in (6, 7):
+        if layout == "lx":
+            groups = re.findall(r"\d+", raw_score_text)
+            if len(groups) >= 2 and len(groups[-2]) >= 3 and len(groups[-1]) >= 3:
+                middle = groups[-2][-3:]
+                last = groups[-1][:3] if len(groups[-1]) == 4 else groups[-1][-3:]
+                score = "1" + middle + last
+            elif len(digits) == 7 and digits.startswith("1"):
+                score = digits
+            elif len(digits) == 7 and digits.startswith("0") and digits.endswith("1"):
+                score = digits[-1] + digits[:-1]
+            elif len(digits) == 6:
+                score = "1" + digits
+        elif len(digits) in (6, 7):
             score = digits
         elif len(digits) == 8 and digits.startswith("100"):
             score = digits[:3] + digits[4:]
@@ -411,7 +470,7 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             "index": index,
             "score": score,
             "name": name,
-            "difficulty": classify_difficulty(crop),
+            "difficulty": classify_difficulty(crop, layout),
             "preview": preview,
             "raw": [str(raw_name), str(raw_score)],
         })
@@ -431,7 +490,7 @@ def recognize():
     try:
         image = decode_image(upload.read())
         requested_layout = request.form.get("layout", "tippy")
-        layout = requested_layout if requested_layout in ("tippy", "mate") else "tippy"
+        layout = requested_layout if requested_layout in ("tippy", "mate", "lx") else "tippy"
         expected = int(request.form.get("expected", "45"))
         cards = reading_order(detect_cards(image, layout))
         if expected in (45, 50):

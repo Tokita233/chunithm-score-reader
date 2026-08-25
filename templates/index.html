@@ -38,6 +38,7 @@
       <select id="layout" name="layout">
         <option value="tippy" selected>提比 bot</option>
         <option value="mate">qiu bot</option>
+        <option value="lx">Lx bot</option>
       </select>
     </label>
     <label>读取
@@ -110,7 +111,7 @@ form.addEventListener("submit", async e => {
     }
     if (!response.ok) throw new Error(data.error || "识别失败");
     data.items.forEach(item => results.append(renderItem(item)));
-    const layoutLabel = data.layout === "mate" ? "qiu bot" : "提比 bot";
+    const layoutLabel = data.layout === "mate" ? "qiu bot" : data.layout === "lx" ? "Lx bot" : "提比 bot";
     status.textContent = `已按 ${layoutLabel} 识别 ${data.count} 个元素。请对照左侧卡片快速校对后复制。`;
   } catch (err) {
     status.textContent = err.message;
