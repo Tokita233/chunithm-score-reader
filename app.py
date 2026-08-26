@@ -58,8 +58,15 @@ _full_ocr: RapidOCR | None = None
 
 
 def normalize_title(value: str) -> str:
+    # Fold Greek glyphs that the Japanese OCR model reads as visually similar
+    # Latin characters (χρόνος -> xpovos, Λzure -> azure, ΩΩ -> oo).
+    value = value.casefold().translate(str.maketrans({
+        "α": "a", "β": "b", "χ": "x", "ρ": "p", "ο": "o",
+        "ό": "o", "ν": "v", "σ": "s", "ς": "s", "ω": "w",
+        "ώ": "w", "λ": "a", "μ": "u",
+    }))
     return re.sub(
-        r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff]", "", value.casefold()
+        r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff]", "", value
     )
 
 
@@ -423,10 +430,10 @@ def song_title_match(value: str) -> tuple[float, str]:
     # The tiny stylized キミツアー→ logo has several stable OCR shapes across
     # crop widths (チラツアー, ナラツ7ー, キラツアー).  Normalize that family
     # before the generic matcher; the title is absent from SEGA's active list.
-    if re.match(r"^[キチナまリ]?[ミまラチ]?[ツッ][7ア了]ー", value):
+    if re.match(r"^[キチナまリ].{0,4}[ツ7ア了].*ー", value):
         return 1.0, "キミツアー→"
     query = normalize_title(value)
-    if len(query) < 3 or not NORMALIZED_SONG_TITLES:
+    if len(query) < 2 or not NORMALIZED_SONG_TITLES:
         return 0.0, value
     query_has_japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", query))
     best_score, best_title = 0.0, value
@@ -434,6 +441,11 @@ def song_title_match(value: str) -> tuple[float, str]:
         if not candidate:
             continue
         score = difflib.SequenceMatcher(None, query, candidate, autojunk=False).ratio()
+        if (
+            query_has_japanese and len(query) == len(candidate) == 2
+            and any(left == right for left, right in zip(query, candidate))
+        ):
+            score += 0.15
         # Short titles commonly gain a few characters from the dark rounded
         # card edge.  An exact candidate prefix is strong evidence (Air/Airdn,
         # Lapis/Lapisodere, Rebellion/Rebellionono).
@@ -546,6 +558,10 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             name = name.strip(" .'\"?|-\u3000")
             name = re.sub(r"\s+[-'\".?]*(?:e|w|we|wt|rm|me)[.'\"?]*$", "", name, flags=re.I).strip()
         name = re.sub(r"ー{2,}$", "ー", name)
+        if layout != "tippy":
+            # qiu bot and Lx bot use the same CHUNITHM catalogue.  Their
+            # larger title text needs only one OCR pass before canonicalizing.
+            name = canonical_song_title(name)
         raw_score_text = str(raw_score).upper().translate(
             str.maketrans({"B": "8", "日": "9"})
         )

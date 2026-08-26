@@ -38,6 +38,8 @@ class TippySampleTests(unittest.TestCase):
         self.assertEqual(app.canonical_song_title("Trackless wildermness"), "Trackless wilderness")
         self.assertEqual(app.canonical_song_title("ホ一リ一サソバラソド"), "ホーリーサンバランド")
         self.assertEqual(app.canonical_song_title("チラツアーー"), "キミツアー→")
+        self.assertEqual(app.canonical_song_title("Xpovos"), "χρόνος")
+        self.assertEqual(app.canonical_song_title("勘滅"), "勦滅")
 
     def test_score_plausibility(self) -> None:
         self.assertTrue(app.plausible_report_score("998931"))
