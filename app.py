@@ -444,7 +444,9 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             name = name.strip(" .'\"?|-\u3000")
             name = re.sub(r"\s+[-'\".?]*(?:e|w|we|wt|rm|me)[.'\"?]*$", "", name, flags=re.I).strip()
         name = re.sub(r"ー{2,}$", "ー", name)
-        raw_score_text = str(raw_score)
+        raw_score_text = str(raw_score).upper().translate(
+            str.maketrans({"B": "8", "日": "9"})
+        )
         digits = re.sub(r"\D", "", raw_score_text)
         score = ""
         if layout == "lx":
@@ -557,10 +559,14 @@ def merge_tippy_results(
 
 
 def parse_tippy_report(image: np.ndarray, cards: list[Card]) -> list[dict]:
-    """Recognize a Tippy report with field detection and score fusion."""
-    detected = parse_cards_batched(image, cards, "tippy")
-    direct = parse_cards_direct(image, cards, "tippy")
-    return merge_tippy_results(image, cards, detected, direct)
+    """Recognize Tippy cards without loading the memory-heavy detector.
+
+    Render's free instance cannot reliably keep the detector, recognizer and
+    a full-resolution 50-card report in memory at the same time.  Fixed title
+    and score bands finish in one lightweight recognizer pass and keep the
+    request comfortably below the proxy timeout.
+    """
+    return parse_cards_direct(image, cards, "tippy")
 
 
 @app.get("/")
