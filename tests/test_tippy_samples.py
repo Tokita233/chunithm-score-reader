@@ -25,6 +25,20 @@ SAMPLE_2_SCORES = """
 
 
 class TippySampleTests(unittest.TestCase):
+    def test_tippy_template_uses_a_constant_row_pitch(self) -> None:
+        import numpy as np
+
+        cards = app.template_cards(np.zeros((3202, 2160, 3), dtype=np.uint8), "tippy")
+        row_ys = [cards[index].y for index in range(0, 30, 5)]
+        pitches = [right - left for left, right in zip(row_ys, row_ys[1:])]
+        self.assertLessEqual(max(pitches) - min(pitches), 1)
+
+    def test_noisy_titles_are_corrected_from_local_catalog(self) -> None:
+        self.assertEqual(app.canonical_song_title("Airdn"), "Air")
+        self.assertEqual(app.canonical_song_title("Trackless wildermness"), "Trackless wilderness")
+        self.assertEqual(app.canonical_song_title("ホ一リ一サソバラソド"), "ホーリーサンバランド")
+        self.assertEqual(app.canonical_song_title("チラツアーー"), "キミツアー→")
+
     def test_score_plausibility(self) -> None:
         self.assertTrue(app.plausible_report_score("998931"))
         self.assertTrue(app.plausible_report_score("1007411"))

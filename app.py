@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import base64
+import difflib
 import io
+import json
 import re
 import threading
 import webbrowser
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -52,6 +55,21 @@ class RecognitionOnlyOCR:
 
 ocr = RecognitionOnlyOCR()
 _full_ocr: RapidOCR | None = None
+
+
+def normalize_title(value: str) -> str:
+    return re.sub(
+        r"[^0-9a-z\u3040-\u30ff\u3400-\u9fff]", "", value.casefold()
+    )
+
+
+try:
+    SONG_TITLES = json.loads(
+        Path(__file__).with_name("song_titles.json").read_text(encoding="utf-8")
+    )
+except (OSError, ValueError):
+    SONG_TITLES = []
+NORMALIZED_SONG_TITLES = [(title, normalize_title(title)) for title in SONG_TITLES]
 
 
 def full_ocr() -> RapidOCR:
@@ -165,8 +183,12 @@ def template_cards(image: np.ndarray, layout: str | None = None) -> list[Card]:
         ]
 
     xs = [0.020, 0.215, 0.410, 0.605, 0.800]
-    top_ys = [0.252, 0.316, 0.381, 0.446, 0.511, 0.575]
-    current_ys = [0.726, 0.790, 0.855, 0.919]
+    # Tippy uses a constant ~210 px row pitch at 3202 px image height.
+    # The previous hand-rounded values accumulated 12–16 px of vertical
+    # drift by the last row, clipping titles/scores near the crop boundary.
+    row_pitch = 0.065584
+    top_ys = [0.25203 + row * row_pitch for row in range(6)]
+    current_ys = [0.72611 + row * row_pitch for row in range(4)]
     cw, ch = round(w * 0.184), round(h * 0.054)
     return [
         Card(round(w * x), round(h * y), cw, ch)
@@ -385,10 +407,64 @@ def parse_cards_batched(image: np.ndarray, cards: list[Card], layout: str) -> li
     ]
 
 
+def clean_tippy_title(value: str) -> str:
+    """Remove OCR debris outside the visible Tippy title line."""
+    value = re.sub(r"[|＿_]\s*", " ", value)
+    value = re.sub(r"\s+", " ", value).strip(" .'\"?|_-\u3000")
+    # A lone glyph after punctuation is normally sampled from the rounded
+    # card edge.  Keep ordinary two-word titles (including the real "Ai C").
+    value = re.sub(r"\s+[-–—:]+\s*[A-Za-z0-9]$", "", value).strip()
+    value = re.sub(r"([.!?])\1+$", r"\1", value)
+    return value
+
+
+def song_title_match(value: str) -> tuple[float, str]:
+    """Return confidence and closest title from the bundled official list."""
+    # The tiny stylized キミツアー→ logo has several stable OCR shapes across
+    # crop widths (チラツアー, ナラツ7ー, キラツアー).  Normalize that family
+    # before the generic matcher; the title is absent from SEGA's active list.
+    if re.match(r"^[キチナまリ]?[ミまラチ]?[ツッ][7ア了]ー", value):
+        return 1.0, "キミツアー→"
+    query = normalize_title(value)
+    if len(query) < 3 or not NORMALIZED_SONG_TITLES:
+        return 0.0, value
+    query_has_japanese = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", query))
+    best_score, best_title = 0.0, value
+    for title, candidate in NORMALIZED_SONG_TITLES:
+        if not candidate:
+            continue
+        score = difflib.SequenceMatcher(None, query, candidate, autojunk=False).ratio()
+        # Short titles commonly gain a few characters from the dark rounded
+        # card edge.  An exact candidate prefix is strong evidence (Air/Airdn,
+        # Lapis/Lapisodere, Rebellion/Rebellionono).
+        if len(candidate) >= 3 and query.startswith(candidate):
+            score = max(score, 0.90)
+        # Long report titles are visibly clipped; prefer the full database
+        # title when the readable OCR prefix agrees.
+        if len(query) >= 5 and candidate.startswith(query):
+            score = max(score, 0.72 + 0.20 * len(query) / len(candidate))
+        # A Japanese prefix is especially discriminative among Latin titles
+        # that otherwise contain the same word (e.g. 献身 + Paradox).
+        if query_has_japanese:
+            jp_query = re.sub(r"[^\u3040-\u30ff\u3400-\u9fff]", "", query)
+            jp_candidate = re.sub(r"[^\u3040-\u30ff\u3400-\u9fff]", "", candidate)
+            if len(jp_query) >= 2 and jp_candidate.startswith(jp_query):
+                score += 0.15
+        if score > best_score:
+            best_score, best_title = score, title
+    return best_score, best_title
+
+
+def canonical_song_title(value: str) -> str:
+    score, title = song_title_match(value)
+    return title if score >= 0.60 else value
+
+
 def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> list[dict]:
     """Read fixed title/score bands directly; avoids costly text detection."""
     crops: list[np.ndarray] = []
     title_images: list[np.ndarray] = []
+    compact_title_images: list[np.ndarray] = []
     score_images: list[np.ndarray] = []
     if layout == "lx":
         title_box = (0.335, 0.13, 0.990, 0.34)
@@ -400,15 +476,23 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
         # The old Tippy Bot card has a separate rank header above the title.
         # Start at 22%: at 18% the rank/constant badges bleed into short titles,
         # especially in the last BEST row of 1295px-wide reports.
-        title_box = (0.350, 0.22, 0.995, 0.43)
+        # Stop before the far-right rounded corner.  That area contains rank
+        # badges/background highlights which the recognizer often turns into
+        # bogus suffixes such as "dorkee", "LO" or "oo".
+        title_box = (0.340, 0.20, 0.900, 0.43)
         score_box = (0.35, 0.40, 0.995, 0.76)
 
-    def band(crop: np.ndarray, box: tuple[float, float, float, float]) -> np.ndarray:
+    def band(
+        crop: np.ndarray,
+        box: tuple[float, float, float, float],
+        scale: float | None = None,
+    ) -> np.ndarray:
         h, w = crop.shape[:2]
         x1, y1, x2, y2 = box
         roi = crop[int(h * y1):max(int(h * y2), int(h * y1) + 1),
                    int(w * x1):max(int(w * x2), int(w * x1) + 1)]
-        return cv2.resize(roi, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+        factor = scale if scale is not None else (4.0 if layout == "tippy" else 3.0)
+        return cv2.resize(roi, None, fx=factor, fy=factor, interpolation=cv2.INTER_CUBIC)
 
     for card in cards:
         crop = image[
@@ -418,7 +502,7 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
         if not crop.size:
             continue
         crops.append(crop)
-        title_image = band(crop, title_box)
+        title_image = band(crop, title_box, 4.0 if layout == "tippy" else None)
         if layout == "lx":
             # LxBot titles are white on a textured purple/black background.
             # Keeping only bright glyphs prevents that texture being decoded
@@ -427,19 +511,37 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             _, bright_title = cv2.threshold(gray_title, 175, 255, cv2.THRESH_BINARY)
             title_image = cv2.cvtColor(cv2.bitwise_not(bright_title), cv2.COLOR_GRAY2BGR)
         title_images.append(title_image)
-        score_image = band(crop, score_box)
-        score_images.append(cv2.copyMakeBorder(
-            score_image, 12, 12, 20, 20, cv2.BORDER_CONSTANT, value=(255, 255, 255)
-        ))
+        if layout == "tippy":
+            # A second, shorter crop lets three- or four-character titles be
+            # read without album-art texture to their right (notably ANU).
+            compact_title_images.append(band(crop, (0.340, 0.16, 0.750, 0.43), 4.0))
+        score_image = band(crop, score_box, 2.5 if layout == "tippy" else None)
+        if layout == "tippy":
+            # The score is light text on a dark panel.  A white frame creates
+            # two strong artificial edges and causes 0/8/9 substitutions.
+            score_images.append(score_image)
+        else:
+            score_images.append(cv2.copyMakeBorder(
+                score_image, 12, 12, 20, 20, cv2.BORDER_CONSTANT, value=(255, 255, 255)
+            ))
 
-    title_output = ocr.recognize_txt(title_images)
+    title_output = ocr.recognize_txt(title_images + compact_title_images)
     score_output = ocr.recognize_txt(score_images)
     results: list[dict] = []
+    title_count = len(title_images)
     for index, (crop, raw_name, raw_score) in enumerate(
-        zip(crops, title_output.txts, score_output.txts), 1
+        zip(crops, title_output.txts[:title_count], score_output.txts), 1
     ):
         name = re.sub(r"\s+(MASTER|ULTIMA|EXPERT|ADVANCED|BASIC).*$", "", str(raw_name), flags=re.I)
         name = re.sub(r"\s+", " ", name).strip(" .|_-\u3000")
+        if layout == "tippy":
+            name = clean_tippy_title(name)
+            compact_raw = str(title_output.txts[title_count + index - 1])
+            compact_name = clean_tippy_title(compact_raw)
+            regular_score, regular_title = song_title_match(name)
+            compact_score, compact_title = song_title_match(compact_name)
+            if max(regular_score, compact_score) >= 0.60:
+                name = compact_title if compact_score > regular_score else regular_title
         if layout == "lx":
             name = name.strip(" .'\"?|-\u3000")
             name = re.sub(r"\s+[-'\".?]*(?:e|w|we|wt|rm|me)[.'\"?]*$", "", name, flags=re.I).strip()
@@ -479,7 +581,9 @@ def parse_cards_direct(image: np.ndarray, cards: list[Card], layout: str) -> lis
             "name": name,
             "difficulty": classify_difficulty(crop, layout),
             "preview": preview,
-            "raw": [str(raw_name), str(raw_score)],
+            "raw": [str(raw_name), str(raw_score)] + (
+                [str(title_output.txts[title_count + index - 1])] if layout == "tippy" else []
+            ),
         })
     return results
 
